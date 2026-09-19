@@ -1129,12 +1129,49 @@ static void away_assignment_event(const Digit::PrimeServer::Models::AwayAssignme
   }
 }
 
+// PROBE: logs id/state/rarity/template_id/job_uuid/has_parameters/duration/max officers and every
+// officerIds key=value entry for one instance, prefixed with `tag` so list vs instance callers are
+// distinguishable in the log.
+static void probe_dump_instance(const char* tag, const Digit::PrimeServer::Models::AwayAssignmentInstance& instance)
+{
+  std::string officer_ids_str;
+  for (const auto& [officer_key, officer_value] : instance.officerids()) {
+    officer_ids_str += STR_FORMAT("{}={} ", officer_key, officer_value);
+  }
+
+  spdlog::warn("[AWAY-PROBE] {} instance id={} state={} rarity={} template_id={} job_uuid={} has_parameters={} "
+              "duration={} max_assignable_officers={} officer_ids=[{}]",
+              tag, instance.id(), static_cast<int32_t>(instance.state()), static_cast<int32_t>(instance.rarity()),
+              instance.awayassignmenttemplateid(), instance.jobuuid(), instance.has_parameters(),
+              instance.parameters().duration(), instance.maxassignableofficerscount(), officer_ids_str);
+}
+
 static void away_assignments_list(std::unique_ptr<std::string>&& bytes)
 {
   using json = nlohmann::json;
   static std::atomic_bool is_first_sync{true};
 
+  // PROBE
+  spdlog::warn("[AWAY-PROBE] away_assignments_list: {} raw bytes", bytes->size());
+
   if (auto response = Digit::PrimeServer::Models::AwayAssignmentUserListResponse(); response.ParseFromString(*bytes)) {
+
+    // PROBE: MessageLite (this proto is optimize_for = LITE_RUNTIME) has no public unknown-field
+    // accessor -- that needs google::protobuf::Message + reflection, which lite classes don't expose.
+    // ByteSizeLong() vs the raw byte count is only a coarse sanity signal (it round-trips preserved
+    // unknown fields too, so it won't isolate them precisely); the cross-parse below is the more
+    // reliable "which interpretation is plausible" signal.
+    spdlog::warn("[AWAY-PROBE] away_assignments_list: parsed as AwayAssignmentUserListResponse, instances={}, "
+                "reserialized_size={} (raw={})",
+                response.instances_size(), response.ByteSizeLong(), bytes->size());
+
+    if (auto cross = Digit::PrimeServer::Models::AwayAssignmentInstance(); cross.ParseFromString(*bytes)) {
+      spdlog::warn("[AWAY-PROBE] away_assignments_list: cross-parsed as bare AwayAssignmentInstance id={} "
+                  "state={} reserialized_size={}",
+                  cross.id(), static_cast<int32_t>(cross.state()), cross.ByteSizeLong());
+    } else {
+      spdlog::warn("[AWAY-PROBE] away_assignments_list: cross-parse as bare AwayAssignmentInstance failed");
+    }
 
     http::logging::trace("PROCESS", "away assignments",
                          STR_FORMAT("Processing {} away assignments", response.instances_size()));
@@ -1148,18 +1185,29 @@ static void away_assignments_list(std::unique_ptr<std::string>&& bytes)
 
       for (const auto& instance : response.instances()) {
         ids_in_response.insert(instance.id());
+
+        // PROBE
+        probe_dump_instance("away_assignments_list:", instance);
+
         away_assignment_event(instance, assignment_array);
       }
 
       // Prune entries that are no longer present to prevent unbounded growth
       for (auto it = trackers::away_assignment_states.begin(); it != trackers::away_assignment_states.end();) {
         if (!ids_in_response.contains(it->first)) {
+          // PROBE
+          spdlog::warn("[AWAY-PROBE] away_assignments_list: pruning collected_away_assignment aid={}", it->first);
+
           assignment_array.push_back({{"type", "collected_" + SyncConfig::Type::AwayAssignments}, {"aid", it->first}});
           it = trackers::away_assignment_states.erase(it);
         } else {
           ++it;
         }
       }
+
+      // PROBE
+      spdlog::warn("[AWAY-PROBE] away_assignments_list: away_assignment_states size after prune={}",
+                  trackers::away_assignment_states.size());
     }
 
     if (!assignment_array.empty()) {
@@ -1175,7 +1223,23 @@ static void away_assignment_instance(std::unique_ptr<std::string>&& bytes)
 {
   using json = nlohmann::json;
 
+  // PROBE
+  spdlog::warn("[AWAY-PROBE] away_assignment_instance: {} raw bytes", bytes->size());
+
   if (auto instance = Digit::PrimeServer::Models::AwayAssignmentInstance(); instance.ParseFromString(*bytes)) {
+
+    // PROBE
+    probe_dump_instance("away_assignment_instance:", instance);
+    spdlog::warn("[AWAY-PROBE] away_assignment_instance: reserialized_size={} (raw={})", instance.ByteSizeLong(),
+                bytes->size());
+
+    if (auto cross = Digit::PrimeServer::Models::AwayAssignmentUserListResponse(); cross.ParseFromString(*bytes)) {
+      spdlog::warn("[AWAY-PROBE] away_assignment_instance: cross-parsed as AwayAssignmentUserListResponse "
+                  "instances={} reserialized_size={}",
+                  cross.instances_size(), cross.ByteSizeLong());
+    } else {
+      spdlog::warn("[AWAY-PROBE] away_assignment_instance: cross-parse as AwayAssignmentUserListResponse failed");
+    }
 
     http::logging::trace("PROCESS", "away assignment instance",
                          STR_FORMAT("Processing away assignment {}", instance.id()));
@@ -1377,6 +1441,9 @@ static void jobs(std::unique_ptr<std::string>&& bytes)
 
   if (auto response = Digit::PrimeServer::Models::JobResponse(); response.ParseFromString(*bytes)) {
 
+    // PROBE
+    spdlog::warn("[AWAY-PROBE] jobs: total jobs in response={}", response.jobs_size());
+
     http::logging::trace("PROCESS", "jobs", STR_FORMAT("Processing {} jobs", response.jobs_size()));
 
     std::unordered_set<std::string> uuids_in_response;
@@ -1386,6 +1453,13 @@ static void jobs(std::unique_ptr<std::string>&& bytes)
     for (const auto& job : response.jobs()) {
       const std::string& uuid = job.uuid();
       uuids_in_response.insert(uuid);
+
+      // PROBE: logged for every occurrence, independent of the jobs_active de-dup below.
+      if (job.type() == Digit::PrimeServer::Models::JOBTYPE_AWAYASSIGNMENT) {
+        spdlog::warn("[AWAY-PROBE] jobs: away assignment job uuid={} aid={} start_time={} duration={}", job.uuid(),
+                    job.awayassignmentparams().awayassignmentinstanceid(), job.starttime().seconds(),
+                    job.duration());
+      }
 
       bool emit = false;
       {
@@ -1559,6 +1633,9 @@ static void officers(std::unique_ptr<std::string>&& bytes)
 
   if (auto response = Digit::PrimeServer::Models::OfficersResponse(); response.ParseFromString(*bytes)) {
 
+    // PROBE
+    spdlog::warn("[AWAY-PROBE] officers: total officers in response={}", response.officers_size());
+
     http::logging::trace("PROCESS", "officers", STR_FORMAT("Processing {} officers", response.officers_size()));
 
     auto officers_array = json::array();
@@ -1566,6 +1643,12 @@ static void officers(std::unique_ptr<std::string>&& bytes)
       std::scoped_lock lk(officer_states_mtx);
 
       for (const auto& officer : response.officers()) {
+        // PROBE
+        if (officer.awayassignmentinstanceid() != 0) {
+          spdlog::warn("[AWAY-PROBE] officers: officer_id={} away_assignment_id={}", officer.id(),
+                      officer.awayassignmentinstanceid());
+        }
+
         const OfficerState officer_state{officer.rankindex(), officer.level(), officer.shardcount(),
                                          officer.awayassignmentinstanceid()};
 
@@ -2263,6 +2346,21 @@ static void HandleEntityGroup(EntityGroup* entity_group)
 
   const auto byteCount = static_cast<size_t>(entity_group->Group->Length);
   const auto *bytesPtr = reinterpret_cast<const char*>(entity_group->Group->bytes->m_Items);
+
+  // PROBE: unconditional (even with away_assignments off), cheap, on the calling (game) thread --
+  // just the type + byte count, no parsing. Covers all 4 away-assignment-adjacent entity groups so
+  // we can see which of 110/111/112/113 the client actually sends and when.
+  switch (entity_group->Type_) {
+    case EntityGroup::Type::AwayAssignmentsStatic:
+    case EntityGroup::Type::AwayAssignmentsList:
+    case EntityGroup::Type::AwayAssignmentsParameter:
+    case EntityGroup::Type::AwayAssignmentsInstance:
+      spdlog::warn("[AWAY-PROBE] HandleEntityGroup type={} bytes={}", static_cast<int32_t>(entity_group->Type_),
+                  byteCount);
+      break;
+    default:
+      break;
+  }
 
   // Helper to run processing asynchronously with exception handling
   auto submit_async = [bytesPtr, byteCount]<typename T>(T&& func) {
